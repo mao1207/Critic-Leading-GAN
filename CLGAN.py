@@ -8,6 +8,8 @@ import os
 import random
 from PIL import Image
 from math import*
+from torch.utils.tensorboard import SummaryWriter   
+writer = SummaryWriter('./path/to/log')
 
 models_path = './models/'
 
@@ -48,11 +50,13 @@ class CLGAN_Attack:
         self.netG = models.Generator(self.gen_input_nc, image_nc).to(device)
         self.netDisc = models.Discriminator(image_nc).to(device)
         self.critic = models.Critic(image_nc).to(device)
+        self.scorer = models.Scorer(image_nc).to(device)
 
         # initialize all weights
         self.netG.apply(weights_init)
         self.netDisc.apply(weights_init)
         self.critic.apply(weights_init)
+        self.scorer.apply(weights_init)
 
         # initialize optimizers
         self.optimizer_G = torch.optim.Adam(self.netG.parameters(),
@@ -61,8 +65,11 @@ class CLGAN_Attack:
                                             lr=0.001)
         self.optimizer_C = torch.optim.Adam(self.critic.parameters(),
                                             lr=0.0001)
+        self.optimizer_S = torch.optim.Adam(self.scorer.parameters(),
+                                            lr=0.0001)
 
         self.epsilon = 0.3
+        self.expected_l2 = 1.5
 
         if not os.path.exists(models_path):
             os.makedirs(models_path)
@@ -73,7 +80,7 @@ class CLGAN_Attack:
 
         # optimize D
         for i in range(1):
-            self.epsilon = 0.3
+            self.epsilon = 0.1
             perturbation = self.netG(x)
             perturbation = torch.clamp(perturbation, -self.epsilon, self.epsilon)
 
@@ -115,17 +122,21 @@ class CLGAN_Attack:
             adv_model = self.model(adv_images)
             adv_probs_model = F.softmax(adv_model, dim=1)
             adv_probability = (torch.gather(adv_probs_model, dim=1, index=true_label)).reshape(x.shape[0], )
-            if epoch < 10:
-                attack = true_probability - adv_probability + torch.norm(true_probs_model - adv_probs_model, dim=1) * torch.norm(true_probs_model - adv_probs_model, dim=1)
+            if epoch < 20:
+                attack = true_probability - adv_probability + torch.norm(true_probs_model - adv_probs_model, 2, dim=1)
             else:
                 # loss_perturb = torch.norm(perturbation.view(perturbation.shape[0], -1), 2, dim=1)
                 # attack = -loss_perturb
                 attack = true_probability - adv_probability
-                attack = torch.where(loss_perturb < torch.median(loss_perturb), attack * 1.1, attack)
+            attack = torch.where(loss_perturb > 2, 0, attack)
+                # if torch.median(loss_perturb) > self.expected_l2:
+                #     attack = torch.where(loss_perturb < torch.median(loss_perturb), attack * 100, attack)
 
             attack_label = torch.where(attack > torch.median(attack), 0, 1)
             attack_mean = torch.mean(attack)
+            # print(attack)
             loss_perturb_mean = torch.mean(loss_perturb)
+            # print(loss_perturb_mean)
 
             original_output = self.model(x)
             adv_output = self.model(x + perturbation)
@@ -142,20 +153,32 @@ class CLGAN_Attack:
             adv_images = x + perturbation
             adv_images = torch.clamp(adv_images, self.box_min, self.box_max)
             judge = self.critic(x.detach(), adv_images)
-            top20_probs_0, top20_indices_0 = torch.topk(judge[:, 0], k=40)
+            score = self.scorer(x.detach(), adv_images)
+            sample_num = min(50, judge.shape[0])
+            top20_probs_0, top20_indices_0 = torch.topk(judge[:, 0], k=sample_num)
             top20_p0_0 = judge[top20_indices_0, 0]
             top20_p1_0 = judge[top20_indices_0, 1]
-            top20_probs_1, top20_indices_1 = torch.topk(judge[:, 1], k=40)
+            top20_probs_1, top20_indices_1 = torch.topk(judge[:, 1], k=sample_num)
             top20_p0_1 = judge[top20_indices_1, 0]
             top20_p1_1 = judge[top20_indices_1, 1]
-            mark_mean = torch.mean(torch.sum(top20_p0_0 - top20_p1_0) + torch.sum(top20_p0_1 - top20_p1_1))
-            # print('0:', torch.argmax(judge[top20_indices_0], dim = 1))
-            # print('1:', torch.argmax(judge[top20_indices_1], dim = 1))
-            # mark_mean = F.mse_loss(judge.squeeze(), torch.zeros_like(judge[:,0], device=self.device))
+            # print(top20_p0_0)
+            # print(top20_p1_1)
+            # indices = torch.cat((top20_indices_0, top20_indices_1))
+            # print(torch.mean(top20_p0_0 - top20_p1_0) + torch.mean(top20_p0_1 - top20_p1_1))
+            # print(F.cross_entropy(judge.squeeze(), torch.zeros_like(judge[:,0], device=self.device).long()))    
+            # print('C', torch.mean(top20_p0_0 - top20_p1_0) + torch.mean(top20_p0_1 - top20_p1_1))
+            # print('S', torch.mean(self.scorer(x.detach(), adv_images)))
+            score_mean = torch.mean(torch.where(loss_perturb > 2, 0, score))
+            mark_mean = torch.mean(top20_p0_0 - top20_p1_0) + torch.mean(top20_p0_1 - top20_p1_1) + score_mean * 5
+            # print('0:', attack_label[top20_indices_0])
+            # print('1:', attack_label[top20_indices_1])
+            # mark_mean = F.cross_entropy(judge.squeeze()[indices], torch.zeros_like(judge[indices,0], device=self.device).long())
             if epoch >= 0:
-                loss_perturb = torch.clamp(torch.norm(perturbation.view(perturbation.shape[0], -1), 1.8, dim=1), min=3, max=float('inf'))
-                loss_perturb = torch.mean(loss_perturb)
-                pert_lambda = torch.from_numpy(np.full((x.shape[0],), 1)).to(self.device)
+                loss_perturb_l2 = torch.clamp(torch.norm(perturbation.view(perturbation.shape[0], -1), 2, dim=1), min=self.expected_l2, max=float('inf'))
+                # print(loss_perturb_l2)
+                # print(mark_mean)
+                loss_perturb = torch.mean(loss_perturb_l2)
+                pert_lambda = torch.from_numpy(np.full((x.shape[0],), fabs(loss_perturb)/5)).to(self.device)
                 mark_mean -= torch.mean(pert_lambda * loss_perturb)
             loss_G = -mark_mean
             # if epoch < 3:
@@ -172,12 +195,34 @@ class CLGAN_Attack:
             loss_cl.backward()
             self.optimizer_C.step()
 
+            self.optimizer_S.zero_grad()
+            perturbation = self.netG(x)
+            perturbation = torch.clamp(perturbation, -self.epsilon, self.epsilon)
+            adv_images = x + perturbation
+            adv_images = torch.clamp(adv_images, self.box_min, self.box_max)
+            score = self.scorer(x.detach(), adv_images.detach()).to(self.device)
+            true_model = self.model(x)
+            true_probs_model = F.softmax(true_model, dim=1)
+            true_label = torch.argmax(true_probs_model, axis=1)
+            true_label = torch.unsqueeze(true_label, dim=1)
+            true_probability = (torch.gather(true_probs_model, dim=1, index=true_label)).reshape(x.shape[0], )
+            adv_model = self.model(adv_images)
+            adv_probs_model = F.softmax(adv_model, dim=1)
+            adv_probability = (torch.gather(adv_probs_model, dim=1, index=true_label)).reshape(x.shape[0], )
+            S_attack = true_probability - adv_probability
+            loss_s = nn.MSELoss()(score.squeeze(), S_attack)
+            loss_s.backward()
+            self.optimizer_S.step()
+
+            # judge_label = torch.argmax(judge, dim=1)
+            # print(torch.sum(judge_label[indices] == attack_label[indices])/100)
+
             adv_image = adv_images[0].cpu()
             image1 = Image.fromarray((adv_image[0].detach().numpy() * 255).astype(np.uint8))
             image1 = image1.convert("L")
             image1.save('image.png')
 
-        return loss_D_GAN.item(), loss_G_fake.item(), loss_perturb_mean.item(), attack_mean.item(), mark_mean.item(), loss_cl, acc_suc/acc_sum
+        return loss_D_GAN.item(), loss_G_fake.item(), loss_perturb_mean.item(), attack_mean.item(), mark_mean.item(), loss_cl, loss_s, acc_suc/acc_sum
 
     def train(self, train_dataloader, epochs):
         # pretrained_model = "./models/netC_pretrain_epoch_60.pth"
@@ -215,14 +260,14 @@ class CLGAN_Attack:
         #       (epoch, epochs + 1, mark_sum/len(batch), loss_sum/len(batch) ))
 
         for epoch in range(1, 10001):
-            if epoch == 200:
+            if epoch == 10000:
                 self.optimizer_G = torch.optim.Adam(self.netG.parameters(),
                                                     lr=0.0001)
                 self.optimizer_D = torch.optim.Adam(self.netDisc.parameters(),
                                                     lr=0.0001)
                 self.optimizer_C = torch.optim.Adam(self.critic.parameters(),
                                                     lr=0.0001)
-            if epoch == 400:
+            if epoch == 20000:
                 self.optimizer_G = torch.optim.Adam(self.netG.parameters(),
                                                     lr=0.00001)
                 self.optimizer_D = torch.optim.Adam(self.netDisc.parameters(),
@@ -235,11 +280,13 @@ class CLGAN_Attack:
             loss_adv_sum = 0
             critic_mark_sum = 0
             loss_critic_sum = 0
+            loss_s_sum = 0
+            attack_success_rate_sum = 0
             for i, data in enumerate(train_dataloader, start=0):
                 images, labels = data
                 images, labels = images.to(self.device), labels.to(self.device)
 
-                loss_D_batch, loss_G_fake_batch, loss_perturb_batch, loss_adv_batch, critic_mark_batch, loss_critic_batch, attack_success_rate = \
+                loss_D_batch, loss_G_fake_batch, loss_perturb_batch, loss_adv_batch, critic_mark_batch, loss_critic_batch, loss_s_batch, attack_success_rate = \
                     self.train_batch(images, epoch)
                 loss_D_sum += loss_D_batch
                 loss_G_fake_sum += loss_G_fake_batch
@@ -247,6 +294,8 @@ class CLGAN_Attack:
                 loss_adv_sum += loss_adv_batch
                 critic_mark_sum += critic_mark_batch
                 loss_critic_sum += loss_critic_batch
+                loss_s_sum += loss_s_batch
+                attack_success_rate_sum += attack_success_rate
                 # print("epoch %d:\nloss_D: %.3f, loss_G_fake: %.3f,\
                 #  \nloss_perturb: %f, loss_adv: %f, critic_mark: %f, loss_critic: %f, acc: %f\n" %
                 #       (epoch, loss_D_batch, loss_G_fake_batch,
@@ -256,13 +305,18 @@ class CLGAN_Attack:
             # print statistics
             num_batch = len(train_dataloader)
             print("epoch %d:\nloss_D: %.3f, loss_G_fake: %.3f,\
-             \nloss_perturb: %f, loss_adv: %f, critic_mark: %f, loss_critic: %f, acc: %f\n" %
+             \nloss_perturb: %f, loss_adv: %f, critic_mark: %f, loss_critic: %f, loss_s: %f, acc: %f\n" %
                   (epoch, loss_D_sum / num_batch, loss_G_fake_sum / num_batch,
                    loss_perturb_sum / num_batch, loss_adv_sum / num_batch, critic_mark_sum / num_batch,
-                   loss_critic_sum / num_batch, attack_success_rate))
+                   loss_critic_sum / num_batch, loss_s_sum/num_batch, attack_success_rate_sum/num_batch))
+            
+            writer.add_scalar('loss_critic', loss_critic_sum / num_batch, epoch)
+            writer.add_scalar('loss_s', loss_s_sum/num_batch, epoch)
+            writer.add_scalar('attack_success_rate', attack_success_rate_sum/num_batch, epoch)
+
 
             # save generator
-            if epoch % 20 == 0:
+            if epoch % 50 == 0:
                 netG_file_name = models_path + 'netG_epoch_' + str(epoch) + '.pth'
                 torch.save(self.netG.state_dict(), netG_file_name)
                 netD_file_name = models_path + 'netD_epoch_' + str(epoch) + '.pth'
@@ -344,6 +398,8 @@ class AdvGAN_Attack:
             onehot_labels = torch.eye(self.model_num_labels, device=self.device)[labels]
 
             # C&W loss function
+            probs_label = torch.argmax(probs_model, dim=1)
+            attack_success_rate = torch.sum(probs_label != labels) / probs_label.shape[0]
             real = torch.sum(onehot_labels * probs_model, dim=1)
             other, _ = torch.max((1 - onehot_labels) * probs_model - onehot_labels * 10000, dim=1)
             zeros = torch.zeros_like(other)
@@ -360,7 +416,7 @@ class AdvGAN_Attack:
             loss_G.backward()
             self.optimizer_G.step()
 
-        return loss_D_GAN.item(), loss_G_fake.item(), loss_perturb.item(), loss_adv.item()
+        return loss_D_GAN.item(), loss_G_fake.item(), loss_perturb.item(), loss_adv.item(), attack_success_rate.item()
 
     def train(self, train_dataloader, epochs):
         for epoch in range(1, epochs+1):
@@ -379,23 +435,25 @@ class AdvGAN_Attack:
             loss_G_fake_sum = 0
             loss_perturb_sum = 0
             loss_adv_sum = 0
+            attack_success_rate_sum = 0
             for i, data in enumerate(train_dataloader, start=0):
                 images, labels = data
                 images, labels = images.to(self.device), labels.to(self.device)
 
-                loss_D_batch, loss_G_fake_batch, loss_perturb_batch, loss_adv_batch = \
+                loss_D_batch, loss_G_fake_batch, loss_perturb_batch, loss_adv_batch, attack_success_rate = \
                     self.train_batch(images, labels)
                 loss_D_sum += loss_D_batch
                 loss_G_fake_sum += loss_G_fake_batch
                 loss_perturb_sum += loss_perturb_batch
                 loss_adv_sum += loss_adv_batch
+                attack_success_rate_sum += attack_success_rate
 
             # print statistics
             num_batch = len(train_dataloader)
             print("epoch %d:\nloss_D: %.3f, loss_G_fake: %.3f,\
-             \nloss_perturb: %.3f, loss_adv: %.3f, \n" %
+             \nloss_perturb: %.3f, loss_adv: %.3f, \n, attack_success_rate: %.3f" %
                   (epoch, loss_D_sum/num_batch, loss_G_fake_sum/num_batch,
-                   loss_perturb_sum/num_batch, loss_adv_sum/num_batch))
+                   loss_perturb_sum/num_batch, loss_adv_sum/num_batch, attack_success_rate_sum/num_batch))
 
             # save generator
             if epoch%20==0:
